@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { createEntryFlowServer } from '../server/index.js';
+import { runLocalReview } from '../src/retrieval.js';
 
 async function start(server, context) {
   server.listen(0, '127.0.0.1');
@@ -94,4 +95,56 @@ test('RAG sends only matching excerpts and validates every returned citation usi
   assert.equal((await post(origin, { ...inputs, query: '停车场' })).status, 422);
   assert.equal((await post(origin, { ...inputs, query: '仓'.repeat(301) })).status, 413);
   assert.equal(captured.length, 3);
+});
+
+test('structured review reuses local evidence, withholds unrelated source text and rejects guessed IDs', async (context) => {
+  const captured = [];
+  let mode = 'valid';
+  const upstream = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const payload = JSON.parse(data.messages[1].content);
+    captured.push(payload);
+    const rule = payload.evidence.find(({ source }) => source === 'rule');
+    const project = payload.evidence.find(({ source }) => source === 'project');
+    const citations = mode === 'valid' ? [rule.id, project.id] : [project.id];
+    if (mode === 'unknown') citations.push('rule-999-1');
+    response.setHeader('Content-Type', 'application/json');
+    if (mode === 'oversized') return response.end(' '.repeat(129 * 1024));
+    response.end(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({ answer: '核对评审是否能访问仓库。', citations }) } }],
+    }));
+  });
+  const upstreamOrigin = await start(upstream, context);
+  const origin = await start(createEntryFlowServer({ env: {
+    ENTRYFLOW_AI_BASE_URL: `${upstreamOrigin}/v1`,
+    ENTRYFLOW_AI_API_KEY: 'mock-test-key',
+    ENTRYFLOW_AI_MODEL: 'mock-model',
+  } }), context);
+  const inputs = {
+    preset: 'repo-process',
+    ruleText: '作品公开仓库需要供评审访问。\n团队人数最多三人。\nGit 历史须细粒度提交。',
+    projectSummary: '当前仓库尚未公开。内部会议记录不属于本次复核。',
+  };
+  const local = runLocalReview(inputs);
+  const response = await post(origin, inputs);
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  const sameEvidence = [...local.ruleExcerpts, ...local.projectExcerpts].map(({ score: _, ...excerpt }) => excerpt);
+  assert.deepEqual(captured[0], { query: local.query, evidence: sameEvidence });
+  assert.ok(!JSON.stringify(captured[0]).includes('内部会议记录'));
+  assert.ok(!JSON.stringify(captured[0]).includes('团队人数'));
+  assert.deepEqual(result, { answer: '核对评审是否能访问仓库。', citations: [sameEvidence[0], sameEvidence[2]] });
+  assert.equal(result.citations[0].line, result.citations[1].line);
+  assert.notEqual(result.citations[0].id, result.citations[1].id);
+
+  for (const failure of ['project-only', 'unknown', 'oversized']) {
+    mode = failure;
+    assert.equal((await post(origin, inputs)).status, 502);
+  }
+  assert.equal((await post(origin, { ...inputs, preset: 'bogus' })).status, 400);
+  assert.equal((await post(origin, { ...inputs, preset: 'custom', query: '' })).status, 400);
+  assert.equal((await post(origin, { ...inputs, ruleText: '必须具有正式学籍。' })).status, 422);
+  assert.equal(captured.length, 4);
 });
