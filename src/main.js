@@ -1,5 +1,5 @@
 import './styles.css';
-import { icon, renderShell } from './layout.js';
+import { icon, keepFocusedControlInView, renderShell } from './layout.js';
 import { analyzeRules, readRuleFile, retrieveEvidence } from './evidence.js';
 import { demoDraft } from './demo.js';
 import {
@@ -38,6 +38,7 @@ const app = document.querySelector('#app');
 app.innerHTML = renderShell();
 const content = app.querySelector('#stage-content');
 const aside = app.querySelector('#stage-aside');
+keepFocusedControlInView(content);
 const live = document.createElement('div');
 live.className = 'visually-hidden';
 live.setAttribute('role', 'status');
@@ -160,6 +161,11 @@ function renderStage({ focus = false } = {}) {
   app.querySelector('#stage-description').textContent = description;
   updateSaveStatus();
   updateStageNavigation();
+  const columns = content.parentElement;
+  const checklistStage = state.stage === 'checklist';
+  columns.classList.toggle('is-checklist', checklistStage);
+  if (checklistStage && columns.firstElementChild !== aside) content.before(aside);
+  if (!checklistStage && columns.firstElementChild !== content) aside.before(content);
 
   if (state.stage === 'intake') {
     content.innerHTML = renderIntake();
@@ -217,7 +223,7 @@ function renderIntake() {
         <div class="field-meta" id="rule-file-status" aria-live="polite">
           ${importNotice ? `<span>${escapeHtml(importNotice)}</span>` : ''}
           ${fileName ? `<span>${icon('file', 14)}${escapeHtml(fileName)}</span>` : ''}
-          <span id="sample-source-tag">${sampleTag()}</span>
+          ${state.sample ? `<span id="sample-source-tag">${sampleTag()}</span>` : ''}
         </div>
       </div>
     </div>`);
@@ -268,7 +274,7 @@ function updateIntakeAside() {
 
 function sourceLine(item) {
   if (!item.line) {
-    const label = item.manual || item.kind === 'manual' ? '手动补录' : '赛规摘录';
+    const label = item.manual || item.kind === 'manual' || item.kind === 'gate' ? '手动补录' : '赛规摘录';
     return `<span class="muted">${label}</span>`;
   }
   return `<button type="button" class="inline-link" data-action="show-line" data-line="${Number(item.line)}">
@@ -490,12 +496,16 @@ function renderTask(task, index) {
 
 function renderChecklist() {
   if (!hasCurrentAnalysis(state)) {
-    return panel('投递任务', '', emptyState('等待核验门槛', '完成当前赛规的内容提取与核验后，即可生成投递清单。',
+    const title = state.checklist ? '资料已变更' : '等待核验门槛';
+    const message = state.checklist
+      ? '返回录入页重新提取并核验。同一赛事和项目中，来源不变的材料任务会带回原有进度。'
+      : '完成当前赛规的内容提取与核验后，即可生成投递清单。';
+    return panel('投递任务', '', emptyState(title, message,
       button('返回录入资料', 'open-intake', { style: 'primary' })));
   }
   if (!hasCurrentChecklist(state)) {
     const message = state.checklist
-      ? '核验结果或资料已更新。请重新生成清单以查看当前任务。'
+      ? '核验结果或资料已更新。重新生成后，同一赛事和项目下的相同材料与手动任务会保留原有进度。'
       : '核验赛规后，可将投递材料及尚未解决的门槛转成任务。';
     return panel('投递任务', '', emptyState(state.checklist ? '清单等待更新' : '等待生成清单', message,
       button('返回门槛核验', 'open-review', { style: 'primary' })));
@@ -540,8 +550,7 @@ function updateChecklistAside() {
       <p class="field-hint">已完成的任务 / 全部任务</p>
     </div>
     <p class="field-hint">${reviewCopy}</p>`,
-    button('导出 Markdown', 'export-markdown', { symbol: 'download' })) +
-    panel('投递前核对', '', '<p class="field-hint">清单用于准备与记录。材料完成后请使用赛事官方提交入口。</p>');
+    button('导出 Markdown', 'export-markdown', { symbol: 'download' }));
 }
 
 function focusRuleLine(line) {

@@ -179,7 +179,7 @@ function markdown(value) {
 
 function sourceReference(item) {
   if (item.line) return `赛规第 ${item.line} 行`;
-  return item.manual ? '手动补录' : '赛规摘录';
+  return item.manual || item.kind === 'gate' || item.kind === 'manual' ? '手动补录' : '赛规摘录';
 }
 
 export function exportChecklist(state) {

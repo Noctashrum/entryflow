@@ -31,6 +31,22 @@ export function icon(name, size = 20) {
   return `<svg class="icon" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${paths}</svg>`;
 }
 
+export function keepFocusedControlInView(stageContent) {
+  stageContent.addEventListener('focusin', ({ target }) => {
+    const actionBar = stageContent.querySelector('.stage-action-bar');
+    if (!actionBar || actionBar.contains(target) || !target.matches('button, input, textarea, select, a[href]')) return;
+
+    requestAnimationFrame(() => {
+      if (target !== document.activeElement || !actionBar.isConnected) return;
+      const control = target.getBoundingClientRect();
+      const bar = actionBar.getBoundingClientRect();
+      if (control.bottom > bar.top && control.top < bar.bottom) {
+        window.scrollBy(0, control.bottom - bar.top + 8);
+      }
+    });
+  });
+}
+
 function sideNavigation() {
   return stages.map(({ id, label, iconName }, index) => `
     <button type="button" class="sidebar-link${index === 0 ? ' is-active' : ''}" data-stage="${id}"${index === 0 ? ' aria-current="step"' : ''}>
