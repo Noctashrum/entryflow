@@ -1,19 +1,27 @@
 import './styles.css';
 import { icon, keepFocusedControlInView, renderShell } from './layout.js';
 import { analyzeRules, readRuleFile, retrieveEvidence } from './evidence.js';
+import { REVIEW_PRESETS, runLocalReview } from './retrieval.js';
 import { demoDraft } from './demo.js';
 import {
   DRAFT_FIELDS,
   GATE_STATUS,
   TASK_STATUS,
   addGate,
+  addSubmissionReviewTasks,
   addTask,
   applyAnalysis,
+  currentSubmissionReview,
   exportChecklist,
   generateChecklist,
   hasCurrentAnalysis,
   hasCurrentChecklist,
   initialState,
+  reviewCitationLabel,
+  reviewSourcesMatch,
+  saveSubmissionReview,
+  submissionReviewOptions,
+  submissionReviewStatus,
   summarize,
 } from './workflow.js';
 
@@ -51,7 +59,7 @@ let importNotice = '';
 let importPending = false;
 let importToken = 0;
 let aiAvailable = false;
-let aiResult = null;
+let aiRequest = null;
 
 function loadState() {
   try {
@@ -277,8 +285,10 @@ function sourceLine(item) {
     const label = item.manual || item.kind === 'manual' || item.kind === 'gate' ? '手动补录' : '赛规摘录';
     return `<span class="muted">${label}</span>`;
   }
-  return `<button type="button" class="inline-link" data-action="show-line" data-line="${Number(item.line)}">
-    ${icon('link', 14)} 赛规第 ${Number(item.line)} 行
+  return `<button type="button" class="inline-link" data-action="show-line" data-line="${Number(item.line)}"
+    data-document="${item.source === 'project' ? 'project' : 'rule'}"
+    data-column="${Number(item.column) || 1}" data-excerpt-length="${item.text?.length || 0}">
+    ${icon('link', 14)} ${escapeHtml(reviewCitationLabel(item))}
   </button>`;
 }
 
@@ -325,6 +335,7 @@ function renderReview() {
 
   const gates = state.analysis.gates;
   return `<div class="panel-stack">
+    ${renderSubmissionReview()}
     ${panel('候选门槛', '引用来自当前录入文本。请按实际凭据确认核验结果。',
       gates.length
         ? `<div class="review-list">${gates.map(renderGate).join('')}</div>`
@@ -372,7 +383,7 @@ function renderReviewAside() {
         <button type="submit" class="button button-secondary">${icon('search', 15)} 检索</button>
       </form>
       <div id="evidence-results" aria-live="polite"></div>
-    `) + `<div id="ai-review-panel" aria-live="polite">${renderAiReview()}</div>`;
+    `);
 }
 
 function updateEvidenceResults() {
@@ -388,27 +399,147 @@ function updateEvidenceResults() {
     : `<p class="field-hint">${evidenceQuery ? '暂无匹配。可尝试更短的关键词或原文用词。' : '输入关键词以查找相关原文。'}</p>`;
 }
 
-function renderAiReview() {
-  if (!aiAvailable) {
-    return panel('AI 复核建议', '', '<p class="field-hint">当前使用本地检索。配置模型服务后可按需复核。</p>');
-  }
+const reviewPresetDescriptions = {
+  'deadline-eligibility': '查看时间和参赛条件',
+  'repo-process': '核查源码、Git 和 AI 协作记录',
+  deliverables: '核对视频、文档及待补材料',
+  custom: '提出与本次投递相关的问题',
+};
 
-  const result = aiResult?.fingerprint === state.analysis?.fingerprint ? aiResult : null;
-  return panel('AI 复核建议', '参考建议由配置的模型生成，请对照引用人工核验。', `
-    <p class="field-hint">发起后，项目摘要、关键词和命中的赛规片段将发送给已配置的模型。</p>
-    ${button(result?.pending ? '正在复核…' : '复核当前关键词', 'ai-review', { symbol: 'sparkles', disabled: result?.pending })}
-    ${result?.error ? `<p class="alert alert-error">${escapeHtml(result.error)}</p>` : ''}
-    ${result?.answer ? `<div class="ai-answer">
-      <p class="field-hint">复核关键词：${escapeHtml(result.query)}</p>
-      <p>${escapeHtml(result.answer)}</p>
-      <ol class="evidence-results">${result.citations.map(item => `<li>${sourceLine(item)}<p>${escapeHtml(item.text)}</p></li>`).join('')}</ol>
-    </div>` : ''}
+function renderSubmissionReview() {
+  const review = currentSubmissionReview(state);
+  const selectedPreset = review?.result.preset ?? REVIEW_PRESETS[0].id;
+  return panel('投递复核', '用赛规原文和项目摘要复核一个问题，将待办建议加入清单。', `
+    <form id="submission-review-form" class="submission-review-form">
+      <fieldset class="review-presets">
+        <legend>选择复核问题</legend>
+        <div class="review-preset-grid">
+          ${REVIEW_PRESETS.map(preset => `<label class="review-preset">
+            <input type="radio" name="preset" value="${preset.id}" ${preset.id === selectedPreset ? 'checked' : ''}>
+            <span><strong>${escapeHtml(preset.label)}</strong><small>${reviewPresetDescriptions[preset.id]}</small></span>
+          </label>`).join('')}
+        </div>
+      </fieldset>
+      <div class="field" id="custom-review-field" ${selectedPreset === 'custom' ? '' : 'hidden'}>
+        <label for="submission-question">你的复核问题</label>
+        <input id="submission-question" name="query" maxlength="180" ${selectedPreset === 'custom' ? 'required' : 'disabled'}
+          value="${selectedPreset === 'custom' ? escapeHtml(review?.result.query) : ''}"
+          placeholder="例如：需要准备哪些软件录屏或说明文件？">
+      </div>
+      <div class="submission-review-actions">
+        <button type="submit" class="button button-primary">${icon('search', 16)} 复核资料</button>
+        <p class="field-hint">赛规和摘要的本地检索在当前浏览器完成。</p>
+      </div>
+    </form>
+    <div id="submission-review-result">${renderSubmissionReviewResult()}</div>
   `);
 }
 
-function updateAiPanel() {
-  const region = aside.querySelector('#ai-review-panel');
-  if (region && hasCurrentAnalysis(state)) region.innerHTML = renderAiReview();
+function citationList(items, noMatches = '未找到明确片段。') {
+  if (!items.length) return `<p class="field-hint">${noMatches}</p>`;
+  return `<ol class="evidence-results review-citations">
+    ${items.map(item => `<li>${sourceLine(item)}<p>${escapeHtml(item.text)}</p></li>`).join('')}
+  </ol>`;
+}
+
+function renderModelReview(review) {
+  const request = aiRequest?.review === review ? aiRequest : null;
+  const { model } = review;
+  return `<section class="model-review" aria-labelledby="model-review-title">
+    <h4 id="model-review-title">${icon('sparkles', 16)} 模型复核 <span class="muted">可选</span></h4>
+    ${aiAvailable ? `<p class="field-hint">发起后，问题和命中的赛规与项目摘要片段会发送给已配置的模型。</p>
+      ${button(request?.pending ? '正在请求模型…' : model ? '重新请求模型' : '请求模型复核', 'ai-review', {
+        symbol: 'sparkles', disabled: request?.pending,
+      })}` : '<p class="field-hint">当前使用浏览器证据复核。配置服务端模型后可追加模型建议。</p>'}
+    ${request?.error ? `<p class="alert alert-error" role="status">${escapeHtml(request.error)}</p>` : ''}
+    ${model ? `<div class="ai-answer">
+      <p>${escapeHtml(model.answer)}</p>
+      ${citationList(model.citations)}
+    </div>` : ''}
+  </section>`;
+}
+
+function renderSubmissionReviewResult(selected = new Set(), question) {
+  const status = submissionReviewStatus(state, question);
+  if (status === 'stale') return '<p class="alert">资料已更新。请重新复核问题，取得当前版本的出处。</p>';
+  if (status === 'question-changed') return '<p class="field-hint" role="status">点击「复核资料」查看所选问题的结果。</p>';
+  if (status === 'empty') return '';
+
+  const review = currentSubmissionReview(state);
+  const { result } = review;
+  const tasks = reviewSourcesMatch(state, state.checklist) ? state.checklist.items : [];
+  const existing = new Set(tasks.map(task => task.key));
+  const suggestions = submissionReviewOptions(state);
+  const hasSelection = suggestions.some(suggestion => selected.has(suggestion.key)
+    && !existing.has(`review:${suggestion.key}`));
+  const source = httpUrl(state.draft.source.trim());
+  return `<section class="submission-review-result" aria-labelledby="submission-result-title">
+    <header class="submission-result-heading">
+      <div>
+        <h3 id="submission-result-title" tabindex="-1">复核结果</h3>
+        <p>${escapeHtml(result.query)}</p>
+      </div>
+      ${badge('本地证据', 'success')}
+    </header>
+    <div class="review-source-grid">
+      <section>
+        <h4>赛规原文 <span>${result.ruleExcerpts.length}</span></h4>
+        <p class="field-hint">${escapeHtml(state.fileName || state.draft.competition)}${source ? ` · <a class="inline-link" href="${escapeHtml(source)}" target="_blank" rel="noopener noreferrer">原始链接</a>` : ''}</p>
+        ${citationList(result.ruleExcerpts)}
+      </section>
+      <section>
+        <h4>项目摘要线索 <span>${result.projectExcerpts.length}</span></h4>
+        <p class="field-hint">${escapeHtml(state.draft.project)}</p>
+        ${citationList(result.projectExcerpts)}
+      </section>
+    </div>
+    ${result.missing.length ? `<section class="review-missing">
+      <h4>${icon('triangle-alert', 17)} 缺少明确证据</h4>
+      <ul>${result.missing.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>
+    </section>` : ''}
+    ${renderModelReview(review)}
+    <form id="review-task-form">
+      <fieldset class="review-suggestion-list">
+        <legend>待人工确认的建议</legend>
+        <p class="field-hint">核对引用后勾选要跟进的事项。加入后作为待办，由你记录进展。</p>
+        ${suggestions.length ? suggestions.map(suggestion => {
+          const added = existing.has(`review:${suggestion.key}`);
+          return `<div class="review-suggestion">
+            <label>
+              <input type="checkbox" name="review-task" value="${escapeHtml(suggestion.key)}"
+                ${added ? 'disabled' : selected.has(suggestion.key) ? 'checked' : ''}>
+              <span>${escapeHtml(suggestion.title)}</span>
+            </label>
+            ${added ? badge('已加入', 'success') : ''}
+            <p>${escapeHtml(suggestion.description)}</p>
+            ${suggestion.citations.length ? `<div class="review-suggestion-sources">${suggestion.citations.map(sourceLine).join('')}</div>` : ''}
+          </div>`;
+        }).join('') : '<p class="field-hint">当前问题没有可加入的建议。可以补充材料后再复核。</p>'}
+      </fieldset>
+      ${suggestions.length ? `<div class="submission-review-actions">
+        <button type="submit" class="button button-primary" id="add-review-tasks" ${!hasSelection ? 'disabled' : ''}>
+          ${icon('list', 16)} 将所选建议加入清单
+        </button>
+        ${suggestions.some(suggestion => existing.has(`review:${suggestion.key}`))
+          ? button('查看投递清单', 'open-checklist', { symbol: 'arrow-right', style: 'quiet' })
+          : ''}
+      </div>` : ''}
+    </form>
+  </section>`;
+}
+
+function selectedReviewTasks() {
+  return [...content.querySelectorAll('#review-task-form input:checked:not(:disabled)')].map(field => field.value);
+}
+
+function updateSubmissionReviewResult({ keepSelection = true, focus = false } = {}) {
+  const region = content.querySelector('#submission-review-result');
+  if (!region) return;
+  const selected = keepSelection ? new Set(selectedReviewTasks()) : new Set();
+  const form = content.querySelector('#submission-review-form');
+  const question = { preset: form.elements.preset.value, query: form.elements.query.value };
+  region.innerHTML = renderSubmissionReviewResult(selected, question);
+  if (focus) region.querySelector('#submission-result-title')?.focus();
 }
 
 function aiEndpoint(path) {
@@ -420,27 +551,20 @@ async function checkAiAvailability() {
     const response = await fetch(aiEndpoint('status'), { headers: { Accept: 'application/json' } });
     if (!response.ok) return;
     aiAvailable = (await response.json()).available === true;
-    if (aiAvailable) updateAiPanel();
+    if (aiAvailable) updateSubmissionReviewResult();
   } catch {
     // Local evidence search is available even when the API cannot be reached.
   }
 }
 
 async function requestAiReview() {
-  if (!aiAvailable || !hasCurrentAnalysis(state)) return;
-  const queryInput = aside.querySelector('#evidence-query');
-  const query = queryInput?.value.trim();
-  if (!query) {
-    queryInput?.setCustomValidity('输入关键词后再发起复核。');
-    queryInput?.reportValidity();
-    return;
-  }
-
-  evidenceQuery = query;
-  updateEvidenceResults();
-  const result = { fingerprint: state.analysis.fingerprint, query, pending: true, error: '', answer: '', citations: [] };
-  aiResult = result;
-  updateAiPanel();
+  const review = currentSubmissionReview(state);
+  if (!aiAvailable || !review || (aiRequest?.review === review && aiRequest.pending)) return;
+  const { preset, query } = review.result;
+  const request = { review, pending: true, error: '' };
+  aiRequest = request;
+  updateSubmissionReviewResult();
+  notice('正在请求模型复核');
 
   try {
     const response = await fetch(aiEndpoint('review'), {
@@ -449,26 +573,32 @@ async function requestAiReview() {
       body: JSON.stringify({
         ruleText: state.draft.rule,
         projectSummary: state.draft.summary,
+        preset,
         query,
       }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(typeof data.error === 'string' ? data.error : '模型服务暂无法复核。');
-    if (typeof data.answer !== 'string' || !Array.isArray(data.citations)) {
+    if (typeof data.answer !== 'string' || !Array.isArray(data.citations) || !data.citations.length) {
       throw new Error('模型服务返回的数据不完整。');
     }
-    result.answer = data.answer;
-    result.citations = data.citations;
+    if (currentSubmissionReview(state) === review) {
+      review.model = { answer: data.answer, citations: data.citations };
+      save();
+      notice('模型复核建议已返回');
+    }
   } catch (error) {
-    result.error = error instanceof SyntaxError ? '模型服务暂无法复核，请稍后重试。' : error.message;
+    request.error = error instanceof SyntaxError || error instanceof TypeError
+      ? '模型服务暂无法复核。仍可使用本地结果。'
+      : error.message;
   } finally {
-    result.pending = false;
-    if (aiResult === result) updateAiPanel();
+    request.pending = false;
+    if (aiRequest === request && currentSubmissionReview(state) === review) updateSubmissionReviewResult();
   }
 }
 
 function renderTask(task, index) {
-  const kindLabel = { material: '投递材料', gate: '门槛待办', manual: '自定义' }[task.kind];
+  const kindLabel = { material: '投递材料', gate: '门槛待办', manual: '自定义', review: '复核待办' }[task.kind];
   return `<article class="task-item" data-task-index="${index}">
     <div class="task-item-heading">
       <div>
@@ -481,6 +611,12 @@ function renderTask(task, index) {
       </div>
     </div>
     ${task.quote ? `<div class="evidence-quote">${sourceLine(task)}<blockquote>${escapeHtml(task.quote)}</blockquote></div>` : ''}
+    ${task.kind === 'review' ? `<details class="review-task-evidence">
+      <summary>复核问题及引用（${task.citations.length}）</summary>
+      <p><strong>${escapeHtml(task.question)}</strong> · ${task.reviewMode === 'model' ? '模型复核' : '本地证据复核'}</p>
+      <p>${escapeHtml(task.description)}</p>
+      ${citationList(task.citations, '此任务用于补充原文或项目凭据。')}
+    </details>` : ''}
     <div class="form-grid">
       <div class="field">
         <label for="task-owner-${index}">负责人</label>
@@ -498,14 +634,14 @@ function renderChecklist() {
   if (!hasCurrentAnalysis(state)) {
     const title = state.checklist ? '资料已变更' : '等待核验门槛';
     const message = state.checklist
-      ? '返回录入页重新提取并核验。同一赛事和项目中，来源不变的材料任务会带回原有进度。'
+      ? '返回录入页重新提取并核验。来源不变的材料任务可保留进度，复核任务请对照新版出处重新加入。'
       : '完成当前赛规的内容提取与核验后，即可生成投递清单。';
     return panel('投递任务', '', emptyState(title, message,
       button('返回录入资料', 'open-intake', { style: 'primary' })));
   }
   if (!hasCurrentChecklist(state)) {
     const message = state.checklist
-      ? '核验结果或资料已更新。重新生成后，同一赛事和项目下的相同材料与手动任务会保留原有进度。'
+      ? '核验结果或资料已更新。重新生成会保留同一赛事和项目下的相同材料和手动任务。录入资料变更后，请重新复核原有建议。'
       : '核验赛规后，可将投递材料及尚未解决的门槛转成任务。';
     return panel('投递任务', '', emptyState(state.checklist ? '清单等待更新' : '等待生成清单', message,
       button('返回门槛核验', 'open-review', { style: 'primary' })));
@@ -553,14 +689,17 @@ function updateChecklistAside() {
     button('导出 Markdown', 'export-markdown', { symbol: 'download' }));
 }
 
-function focusRuleLine(line) {
+function focusDocumentLine(line, documentKind, column, excerptLength) {
   openStage('intake', { focus: false });
-  const field = content.querySelector('#rule');
+  const field = content.querySelector(documentKind === 'project' ? '#summary' : '#rule');
   const lines = field.value.split('\n');
   if (!Number.isInteger(line) || line < 1 || line > lines.length) return;
-  const start = lines.slice(0, line - 1).reduce((offset, text) => offset + text.length + 1, 0);
+  const lineStart = lines.slice(0, line - 1).reduce((offset, text) => offset + text.length + 1, 0);
+  const lineLength = lines[line - 1].length;
+  const start = Math.max(0, Math.min(column - 1, lineLength));
+  const end = excerptLength ? Math.min(start + excerptLength, lineLength) : lineLength;
   field.focus();
-  field.setSelectionRange(start, start + lines[line - 1].length);
+  field.setSelectionRange(lineStart + start, lineStart + end);
   field.scrollTop = Math.max(0, (line - 2) * (parseFloat(getComputedStyle(field).lineHeight) || 20));
 }
 
@@ -573,7 +712,7 @@ function resetWorkspace(sample) {
   importPending = false;
   importNotice = '';
   evidenceQuery = '';
-  aiResult = null;
+  aiRequest = null;
   state = initialState();
   if (sample) {
     state.draft = { ...demoDraft };
@@ -643,8 +782,12 @@ app.addEventListener('click', event => {
     case 'clear-workspace': resetWorkspace(false); break;
     case 'open-intake': openStage('intake'); break;
     case 'open-review': openStage('review'); break;
+    case 'open-checklist': openStage('checklist'); break;
     case 'import-rules': content.querySelector('#rule-file').click(); break;
-    case 'show-line': focusRuleLine(Number(control.dataset.line)); break;
+    case 'show-line':
+      focusDocumentLine(Number(control.dataset.line), control.dataset.document,
+        Number(control.dataset.column), Number(control.dataset.excerptLength));
+      break;
     case 'export-markdown': downloadMarkdown(); break;
     case 'ai-review': void requestAiReview(); break;
     case 'generate-checklist':
@@ -681,8 +824,9 @@ app.addEventListener('input', event => {
     if (field.matches('[data-task-owner]')) task.owner = field.value;
     else task.note = field.value;
     save();
-  } else if (field.id === 'evidence-query') {
+  } else if (field.id === 'submission-question') {
     field.setCustomValidity('');
+    updateSubmissionReviewResult({ keepSelection: false });
   }
 });
 
@@ -691,6 +835,16 @@ app.addEventListener('change', event => {
   if (field.id === 'rule-file') {
     void readImportedFile(field.files[0]);
     field.value = '';
+  } else if (field.name === 'preset' && field.form?.id === 'submission-review-form') {
+    const custom = field.value === 'custom';
+    const question = content.querySelector('#submission-question');
+    content.querySelector('#custom-review-field').hidden = !custom;
+    question.disabled = !custom;
+    question.required = custom;
+    question.setCustomValidity('');
+    updateSubmissionReviewResult({ keepSelection: false });
+  } else if (field.name === 'review-task' && field.form?.id === 'review-task-form') {
+    content.querySelector('#add-review-tasks').disabled = selectedReviewTasks().length === 0;
   } else if (field.matches('[data-gate-status]') && hasCurrentAnalysis(state)) {
     const row = field.closest('[data-gate-index]');
     const gate = state.analysis.gates[Number(row.dataset.gateIndex)];
@@ -744,6 +898,36 @@ app.addEventListener('submit', event => {
       evidenceQuery = String(values.get('query') ?? '').trim();
       updateEvidenceResults();
       break;
+    case 'submission-review-form': {
+      if (!hasCurrentAnalysis(state)) return;
+      const preset = String(values.get('preset'));
+      const query = String(values.get('query') ?? '').trim();
+      if (preset === 'custom' && !query) {
+        form.elements.query.setCustomValidity('请输入一个复核问题。');
+        form.elements.query.reportValidity();
+        return;
+      }
+      saveSubmissionReview(state, runLocalReview({
+        ruleText: state.draft.rule,
+        projectSummary: state.draft.summary,
+        preset,
+        query,
+      }));
+      save();
+      updateSubmissionReviewResult({ keepSelection: false, focus: true });
+      notice('已复核当前赛规和项目摘要');
+      break;
+    }
+    case 'review-task-form': {
+      const count = addSubmissionReviewTasks(state, values.getAll('review-task'));
+      if (!count) return;
+      save();
+      updateStageNavigation();
+      updateSubmissionReviewResult({ keepSelection: false });
+      content.querySelector('[data-action="open-checklist"]')?.focus();
+      notice(`已将 ${count} 项复核建议加入投递清单`);
+      break;
+    }
     case 'gate-form':
       if (!String(values.get('title')).trim()) return;
       addGate(state, String(values.get('title')), String(values.get('source')));

@@ -21,6 +21,7 @@ export function initialState() {
     sample: false,
     analysis: null,
     checklist: null,
+    submissionReview: null,
   };
 }
 
@@ -44,7 +45,104 @@ function reviewSignature(state) {
 }
 
 export function hasCurrentChecklist(state) {
-  return hasCurrentAnalysis(state) && state.checklist?.signature === reviewSignature(state);
+  return hasCurrentAnalysis(state) && state.checklist?.signature === reviewSignature(state)
+    && (!state.checklist.items.some(item => item.kind === 'review') || reviewSourcesMatch(state, state.checklist));
+}
+
+export function reviewSourcesMatch(state, snapshot) {
+  return Boolean(snapshot && state.analysis && snapshot.fingerprint === state.analysis.fingerprint
+    && snapshot.sourceSummary === state.draft.summary);
+}
+
+export function currentSubmissionReview(state) {
+  return hasCurrentAnalysis(state) && reviewSourcesMatch(state, state.submissionReview)
+    ? state.submissionReview
+    : null;
+}
+
+export function submissionReviewStatus(state, question) {
+  const snapshot = state.submissionReview;
+  if (typeof snapshot?.sourceSummary !== 'string') return 'empty';
+  if (!currentSubmissionReview(state)) return 'stale';
+  if (question && (snapshot.result.preset !== question.preset ||
+      (question.preset === 'custom' && snapshot.result.query !== question.query.trim()))) {
+    return 'question-changed';
+  }
+  return 'ready';
+}
+
+export function saveSubmissionReview(state, result) {
+  if (!hasCurrentAnalysis(state)) return null;
+  state.submissionReview = {
+    fingerprint: state.analysis.fingerprint,
+    sourceSummary: state.draft.summary,
+    result,
+    model: null,
+  };
+  return state.submissionReview;
+}
+
+export function submissionReviewOptions(state) {
+  const review = currentSubmissionReview(state);
+  if (!review) return [];
+
+  const { result, model } = review;
+  const sources = new Map([...result.ruleExcerpts, ...result.projectExcerpts].map(source => [source.id, source]));
+  const options = result.suggestions.map(suggestion => ({
+    id: suggestion.id,
+    title: suggestion.title,
+    description: suggestion.description,
+    mode: 'local',
+    citations: [...suggestion.ruleRefs, ...suggestion.projectRefs]
+      .map(id => sources.get(id)).filter(Boolean),
+  }));
+  if (model?.citations.length) {
+    options.push({
+      id: 'model-review',
+      title: `跟进模型复核 · ${result.query}`.slice(0, 180),
+      description: model.answer,
+      mode: 'model',
+      citations: model.citations,
+    });
+  }
+  return options.map(option => ({
+    ...option,
+    key: JSON.stringify([result.preset, result.query, option.mode, option.id, option.title,
+      option.description, option.citations.map(({ source, line, column, text }) => [source, line, column, text])]),
+  }));
+}
+
+export function addSubmissionReviewTasks(state, selectedKeys) {
+  const review = currentSubmissionReview(state);
+  if (!review) return 0;
+  const selected = new Set(selectedKeys);
+  const options = submissionReviewOptions(state).filter(option => selected.has(option.key));
+  if (!options.length) return 0;
+
+  if (!hasCurrentChecklist(state)) generateChecklist(state);
+  const existing = new Set(state.checklist.items.map(item => item.key));
+  const added = [];
+  for (const option of options) {
+    const key = `review:${option.key}`;
+    if (existing.has(key)) continue;
+    existing.add(key);
+    added.push({
+      key,
+      title: option.title,
+      kind: 'review',
+      question: review.result.query,
+      reviewMode: option.mode,
+      description: option.description,
+      citations: option.citations,
+      quote: '',
+      line: null,
+      owner: '',
+      note: '',
+      status: 'pending',
+    });
+  }
+  state.checklist.items.unshift(...added);
+  return added.length;
 }
 
 function requirementKey(item) {
@@ -136,11 +234,15 @@ export function generateChecklist(state) {
   }
 
   const manual = sameWorkspace ? previous.items.filter(item => item.kind === 'manual') : [];
+  const reviewItems = sameWorkspace && reviewSourcesMatch(state, previous)
+    ? previous.items.filter(item => item.kind === 'review')
+    : [];
   state.checklist = {
     workspace,
     fingerprint: state.analysis.fingerprint,
+    sourceSummary: state.draft.summary,
     signature: reviewSignature(state),
-    items: [...items.values(), ...manual],
+    items: [...reviewItems, ...items.values(), ...manual],
   };
 }
 
@@ -182,6 +284,11 @@ function sourceReference(item) {
   return item.manual || item.kind === 'gate' || item.kind === 'manual' ? '手动补录' : '赛规摘录';
 }
 
+export function reviewCitationLabel(item) {
+  const document = item.source === 'project' ? '项目摘要' : '赛规';
+  return `${document}第 ${item.line} 行`;
+}
+
 export function exportChecklist(state) {
   if (!hasCurrentChecklist(state)) return '';
   const { draft, analysis, checklist } = state;
@@ -207,6 +314,14 @@ export function exportChecklist(state) {
     if (item.owner) lines.push(`  - 负责人：${markdown(item.owner)}`);
     if (item.note) lines.push(`  - 备注：${markdown(item.note)}`);
     if (item.quote) lines.push(`  - ${sourceReference(item)}：${markdown(item.quote)}`);
+    if (item.kind === 'review') {
+      lines.push(`  - 复核来源：${item.reviewMode === 'model' ? '模型复核' : '本地证据复核'}`);
+      lines.push(`  - 复核问题：${markdown(item.question)}`);
+      if (item.description) lines.push(`  - 复核建议：${markdown(item.description)}`);
+      for (const citation of item.citations) {
+        lines.push(`  - ${reviewCitationLabel(citation)}：${markdown(citation.text)}`);
+      }
+    }
   }
   return `${lines.join('\n')}\n`;
 }

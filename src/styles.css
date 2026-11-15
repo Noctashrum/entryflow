@@ -342,6 +342,61 @@ summary { cursor: pointer; }
 .evidence-results p { margin-top: 4px; color: #435b66; font-size: 12px; line-height: 1.65; }
 .ai-answer { display: grid; gap: 8px; margin-top: 10px; color: #3e535e; font-size: 13px; line-height: 1.65; }
 .ai-answer > p:not(.field-hint) { white-space: pre-wrap; }
+.submission-review-form, .submission-review-result { display: grid; gap: 15px; min-width: 0; }
+.submission-review-form .field[hidden] { display: none; }
+.review-presets, .review-suggestion-list { min-inline-size: 0; padding: 0; margin: 0; border: 0; }
+.review-presets legend, .review-suggestion-list legend { padding: 0; margin-bottom: 8px; color: var(--ink); font-size: 13px; font-weight: 750; }
+.review-preset-grid, .review-source-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+.review-preset {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fafcfb;
+  cursor: pointer;
+}
+.review-preset:has(:checked) { border-color: #7db9aa; background: #eff9f4; }
+.review-preset:has(:focus-visible) { outline: 2px solid #429f93; outline-offset: 2px; }
+.review-preset input, .review-suggestion input { margin: 0; flex: 0 0 auto; accent-color: var(--accent); }
+.review-preset span, .review-source-grid section { display: grid; min-width: 0; gap: 4px; }
+.review-preset strong { font-size: 13px; line-height: 1.35; }
+.review-preset small { color: var(--muted); font-size: 11px; line-height: 1.45; }
+.submission-review-actions { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+.submission-review-actions > p { flex: 1 1 180px; }
+#submission-review-result:not(:empty) { margin-top: 19px; }
+.submission-review-result { padding-top: 15px; border-top: 1px solid var(--line); }
+.submission-result-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.submission-result-heading h3 { font-size: 16px; }
+.submission-result-heading p { margin-top: 3px; color: var(--muted); font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }
+.submission-result-heading .badge { white-space: nowrap; }
+.review-source-grid section {
+  padding: 10px;
+  align-content: start;
+  border: 1px solid var(--line-soft);
+  border-radius: 9px;
+  overflow-wrap: anywhere;
+}
+.review-source-grid h4, .review-missing h4, .model-review h4 { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.review-source-grid h4 span { color: var(--muted); font-size: 11px; }
+.review-citations li { background: #f5f9f7; overflow-wrap: anywhere; }
+.review-missing { padding: 10px 12px; border: 1px solid #eadbc2; border-radius: 9px; color: var(--warning); background: #fff9eb; }
+.review-missing ul { margin: 6px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.6; }
+.model-review { display: grid; gap: 7px; justify-items: start; padding: 11px; border: 1px solid var(--line-soft); border-radius: 9px; }
+.model-review .ai-answer { min-width: 0; margin-top: 0; overflow-wrap: anywhere; }
+.review-suggestion-list { display: grid; gap: 8px; margin-bottom: 8px; }
+.review-suggestion { padding: 10px; border: 1px solid var(--line-soft); border-radius: 9px; overflow-wrap: anywhere; }
+.review-suggestion:has(:checked) { border-color: #7db9aa; background: #f4faf6; }
+.review-suggestion label { display: inline-flex; align-items: start; gap: 8px; margin-right: 4px; font-size: 13px; font-weight: 740; cursor: pointer; }
+.review-suggestion input { margin-top: 3px; }
+.review-suggestion p, .review-task-evidence > p { margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.6; white-space: pre-wrap; }
+.review-suggestion-sources { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 4px; }
+.review-task-evidence { padding: 9px 12px; border: 1px solid var(--line-soft); border-radius: 8px; background: #fafcfb; overflow-wrap: anywhere; }
+.review-task-evidence summary { color: var(--accent-dark); font-size: 13px; font-weight: 690; }
+.review-task-evidence ol { margin-top: 8px; }
+.task-item-heading h3 { overflow-wrap: anywhere; }
 .stage-aside .panel-body > .button { margin-block: 10px 0; }
 .task-progress { display: grid; gap: 8px; }
 .task-progress + .field-hint { margin-top: 11px; }
@@ -398,6 +453,7 @@ summary { cursor: pointer; }
   .step-label strong { font-size: 11px; }
   .step-label small { display: none; }
   .form-grid { grid-template-columns: minmax(0, 1fr); }
+  .review-source-grid { grid-template-columns: minmax(0, 1fr); }
   .panel-header { margin-bottom: 14px; }
   .review-item, .task-item { padding: 12px; }
   .panel-actions, .stage-action-bar { justify-content: stretch; }
