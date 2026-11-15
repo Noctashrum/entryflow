@@ -33,3 +33,7 @@
 ## 2026-11-16 · 部署
 
 用干净的依赖安装和 Vite 生产构建准备发布，10 项自动化测试全部通过。源码在 `main`，静态产物发布在 gh-pages 分支。GitHub Pages 返回构建完成，公开首页、主 JS、CSS、PDF 解析模块与工作线程均返回 HTTP 200，下载结果的 SHA-256 与本地生产构建逐一相同。[在线工作台](https://noctashrum.github.io/entryflow/) · [源码仓库](https://github.com/Noctashrum/entryflow)
+
+## 公开记录的隐私处理
+
+模块 Prompt 中的本机绝对路径已统一替换为 `<PROJECT_ROOT>`。模块分工、反馈与迭代按实际开发记录整理。Git 提交使用 GitHub 的 noreply 邮箱。
