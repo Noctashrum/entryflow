@@ -1,0 +1,17 @@
+{
+  "name": "entryflow",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build --base=./",
+    "preview": "vite preview --base=./"
+  },
+  "dependencies": {
+    "pdfjs-dist": "5.7.284"
+  },
+  "devDependencies": {
+    "vite": "8.3.8"
+  }
+}
