@@ -1,3 +1,5 @@
+import { allowsStage, clauseScope, indexRuleLines } from './rule-scope.js';
+
 const gateTypes = [
   {
     id: 'eligibility',
@@ -80,9 +82,9 @@ const materialTypes = [
 const submissionContext = /提交(?:物|材料|文件|要求|内容)|交付(?:物|材料|文件|清单|要求)|作品(?:材料|文件|提交要求)|材料清单|需(?:要|另)?(?:提供|提交|上传|附)|(?:必须|应当|须|统一|请)(?:同时|一并|附带)?(?:提交|提供|上传|附上)|(?:提交|上传|提供|附上|附带|包含|包括)[：:\s]|\b(?:submit|deliverables?|must include|required files)\b/iu;
 const startsWithSubmission = /^(?:提交|提供|上传|附上|附带|交付)/u;
 const explicitRequirement = /必须|不得|禁止|不能|只能|仅限|仅可|须|应当|需|限于|要求|方可|must|only|required|shall|prohibited/iu;
-const optionalContext = /可选|选填|非必(?:需|须|填)|不强制|(?:建议|鼓励)(?:[：:、，,\s]|提交|上传|提供|附)|(?:可|可以|允许)(?:同时|自愿|额外)?(?:提交|上传|附上)|举例|例如|仅供参考|optional|encouraged|may (?:submit|include)/iu;
-const materialHeading = /^(?:(?:省赛|国赛|校赛|决赛|初赛)\s*)?(?:(?:参赛|作品|报名|项目|必交|所需|申报|投递)(?:作品)?)?(?:提交(?:的)?(?:材料|文件|内容|要求|物)|交付(?:物|材料|文件|要求|清单)|材料(?:清单|要求)|作品材料|报名材料|需(?:要)?(?:提交|提供|上传)(?:的)?(?:材料|文件|内容)?|(?:required )?(?:submission )?materials|deliverables)[：:。]?$/iu;
-const otherHeading = /^(?:参赛(?:对象|条件|资格|人群|流程)|赛道(?:介绍|说明)|组队(?:限制|要求)|原创(?:要求|说明)|开发(?:要求|规范)|比赛(?:流程|时间|赛程)|(?:评分|评审)(?:规则|标准|要求)|联系方式|报名(?:时间|办法|方式)|其他(?:要求|说明)?|注意事项)[：:。]?$/u;
+const optionalContext = /可选|选填|非必(?:需|须|填)|不强制|(?:^|[（(，,；;：:])\s*(?:建议|鼓励)(?:[：:\s]|提交|上传|提供|附)|(?:可|可以|允许)(?:同时|自愿|额外)?(?:提交|上传|附上)|举例|例如|仅供参考|optional|encouraged|may (?:submit|include)/iu;
+const listItem = /^(?:[-*+•]|[（(]?[0-9一二三四五六七八九十]+[.、)）])\s*/u;
+const concreteDetail = /必须|须|应|至少|至多|不超过|保留|完整|包含|上限|\d\s*(?:条|页|分钟)|must|required/iu;
 const ignoredWords = new Set([
   '是否', '哪些', '什么', '怎样', '如何', '可以', '需要', '必须', '有关', '关于', '要求',
   '参赛', '作品', '项目', '材料', '确认', '赛规', '一个', '对于', '相关', '具备',
@@ -132,17 +134,17 @@ function rankFragments(lines, query, limit) {
     return [word, Math.log(1 + (corpus.length - matches + 0.5) / (matches + 0.5))];
   });
 
-  return corpus.map(({ line, text, normalized }) => {
+  return corpus.map(({ normalized, ...entry }) => {
     const phraseScore = normalized.includes(search) ? 3 : 0;
     const termScore = weights.reduce((score, [word, weight]) => (
       normalized.includes(word) ? score + weight : score
     ), 0);
-    return { line, text, score: phraseScore + termScore };
+    return { ...entry, score: phraseScore + termScore };
   })
     .filter(({ score }) => score > 0)
     .sort((left, right) => right.score - left.score || left.line - right.line)
     .slice(0, limit)
-    .map(({ line, text, score }) => ({ line, text, score: Number(score.toFixed(3)) }));
+    .map(({ score, ...entry }) => ({ ...entry, score: Number(score.toFixed(3)) }));
 }
 
 export function retrieveEvidence(ruleText, query, limit = 5) {
@@ -163,60 +165,77 @@ function headingLabel(value) {
     .replaceAll('**', '').trim();
 }
 
-function extractMaterialTask(quote, line, materials) {
+function materialMatches(quote, record) {
   const matches = materialTypes.filter(({ matches: matcher }) => matcher.test(quote));
-  const matchingTypes = matches.length ? matches : [{
-    id: stableId('material', quote),
-    title: headingLabel(quote).replace(/[：:。；;]$/u, ''),
-  }];
+  if (!record.subsection) return matches;
+  const nearestTypes = materialTypes.filter(({ matches: matcher }) => matcher.test(record.subsection));
+  if (nearestTypes.length !== 1) return matches;
+  // In a Prompt or README subsection, references to formats or files describe that deliverable.
+  if (['prompt-history', 'readme'].includes(nearestTypes[0].id)) return nearestTypes;
+  return !matches.length && concreteDetail.test(quote) ? nearestTypes : matches;
+}
 
-  for (const { id, title } of matchingTypes) {
-    if (materials.has(id)) continue;
-    materials.set(id, { id, title, quote, line });
+function extractMaterialTask(types, reference, materials, multiStage) {
+  const { text: quote, line, column, ...context } = reference;
+  for (const { id: typeId, title } of types) {
+    const id = multiStage && context.stage !== 'general' ? `${typeId}@${context.stage}` : typeId;
+    const existing = materials.get(id);
+    if (!existing) {
+      materials.set(id, { id, typeId, title, quote, line, column, ...context, references: [reference] });
+      continue;
+    }
+    if (!existing.references.some((entry) => entry.line === line && entry.column === column)) {
+      existing.references.push(reference);
+    }
+    if (!concreteDetail.test(existing.quote) && concreteDetail.test(quote)) {
+      Object.assign(existing, { quote, line, column, ...context });
+    }
   }
 }
 
-export function analyzeRules(ruleText, projectSummary = '') {
-  const rules = sourceLines(ruleText);
+export function analyzeRules(ruleText, projectSummary = '', { scope = 'all' } = {}) {
+  const rules = indexRuleLines(ruleText);
+  const structured = rules.some(({ sectionKind }) => sectionKind === 'submission');
+  const multiStage = ['provincial', 'national'].every((stage) => rules.some((record) => record.stage === stage));
   const project = sourceLines(projectSummary).flatMap(({ line, text }) =>
     clauses(text).map((part) => ({ line, text: part })),
   );
   const gates = new Map();
   const materials = new Map();
-  let inMaterials = false;
+  const ruleExcerpts = [];
 
-  for (const { line, text } of rules) {
-    const heading = headingLabel(text);
-    if (materialHeading.test(heading)) {
-      inMaterials = true;
-      continue;
-    }
-    if (otherHeading.test(heading)) {
-      inMaterials = false;
-      continue;
-    }
-    if (/^#{1,6}\s/u.test(text)) inMaterials = false;
-    if (/^(?:提交材料|作品材料|交付物|材料清单|submission materials)\s*[:：]/iu.test(heading)) {
-      inMaterials = true;
-    }
+  for (const record of rules) {
+    if (record.isHeading || record.sectionKind === 'excluded') continue;
+    const { line, text } = record;
+    const inMaterials = record.sectionKind === 'submission';
+    let offset = 0;
 
     for (const quote of clauses(text)) {
+      const start = text.indexOf(quote, offset);
+      offset = start + quote.length;
+      const column = record.column + start;
+      const context = clauseScope(record, quote);
+      if (!allowsStage(context.stage, scope)) continue;
+      const reference = { text: quote, line, column, ...context };
+      ruleExcerpts.push(reference);
       const submittedHere = startsWithSubmission.test(headingLabel(quote)) || submissionContext.test(quote);
-      const isOptional = optionalContext.test(quote);
-      const knownMaterials = materialTypes.filter(({ matches }) => matches.test(quote));
-      const standaloneMaterial = explicitRequirement.test(quote)
-        && knownMaterials.some(({ id }) => id !== 'process');
-      const listedMaterial = inMaterials
-        && (knownMaterials.length > 0 || /^(?:[-*+•]|[（(]?[0-9一二三四五六七八九十]+[.、)）])\s*/u.test(quote));
-      if (!isOptional && ((submittedHere && knownMaterials.length > 0) || standaloneMaterial || listedMaterial)) {
-        extractMaterialTask(quote, line, materials);
+      const isOptional = optionalContext.test(headingLabel(quote));
+      const knownMaterials = materialMatches(quote, record);
+      if (!isOptional && (inMaterials || !structured)) {
+        const standaloneMaterial = explicitRequirement.test(quote) && knownMaterials.some(({ id }) => id !== 'process');
+        if (knownMaterials.length && (inMaterials || submittedHere || standaloneMaterial)) {
+          extractMaterialTask(knownMaterials, reference, materials, multiStage);
+        } else if (inMaterials && listItem.test(quote) && !knownMaterials.length && quote.length <= 45) {
+          const title = headingLabel(quote).replace(/[：:。；;]$/u, '');
+          extractMaterialTask([{ id: stableId('material', quote), title }], reference, materials, multiStage);
+        }
       }
 
       if (isOptional) continue;
       for (const type of gateTypes) {
         if (!type.matches.test(quote)) continue;
         if (type.id === 'development' && !explicitRequirement.test(quote) && submittedHere) continue;
-        const id = stableId(type.id, quote);
+        const id = stableId(multiStage && context.stage !== 'general' ? `${type.id}@${context.stage}` : type.id, quote);
         if (gates.has(id)) continue;
         const relevant = project.filter(({ text: snippet }) => type.projectMatches.test(snippet));
         const [match] = rankFragments(relevant, type.clue, 1);
@@ -225,6 +244,8 @@ export function analyzeRules(ruleText, projectSummary = '') {
           title: type.title,
           quote,
           line,
+          column,
+          ...context,
           suggestion: type.suggestion,
           evidence: match?.text ?? relevant[0]?.text ?? '',
         });
@@ -232,8 +253,8 @@ export function analyzeRules(ruleText, projectSummary = '') {
     }
   }
 
-  const excerpts = retrieveEvidence(
-    ruleText,
+  const excerpts = rankFragments(
+    ruleExcerpts,
     '参赛资格 报名 组队 人数 截止 原创 开发 提示词 交付 提交 视频 仓库',
     5,
   );

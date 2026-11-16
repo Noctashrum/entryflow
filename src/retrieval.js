@@ -1,4 +1,5 @@
 import { analyzeRules } from './evidence.js';
+import { allowsStage, clauseScope, indexRuleLines, mentionedStages, RULE_SCOPE_LABELS, validRuleScope } from './rule-scope.js';
 
 export const REVIEW_PRESETS = [
   { id: 'deadline-eligibility', label: '截止与资格', query: '报名和作品提交何时截止，需要核对哪些参赛资格？' },
@@ -112,28 +113,37 @@ const ignoredTerms = new Set([
 const segmenter = Intl.Segmenter ? new Intl.Segmenter('zh-CN', { granularity: 'word' }) : null;
 const segmentLength = 520;
 const segmentOverlap = 70;
+const deadlineQuery = /截止|截至|最后(?:一天|期限)|最晚|日期|时间|何时|什么时候|几点|哪天|deadline/iu;
+const dateEvidence = /\d{1,4}\s*[-./年]\s*\d{1,2}|\d{1,2}\s*月\s*\d{1,2}\s*(?:日|号)|[0-9一二三四五六七八九十]+(?:个)?(?:天|日|周|小时)内|截止.{0,24}(?:待定|另行|公告|通知|公布)/u;
+const submissionTiming = /交件|投递|作品.{0,8}(?:提交|截止)|提交.{0,8}(?:作品|截止|时间|日期)|交稿|上传作品/u;
+const registrationTiming = /报名|注册/u;
 
 function normalize(value) {
   return value.normalize('NFKC').toLowerCase().replace(/\s+/gu, ' ').trim();
 }
 
 function indexSource(source, value) {
-  return value.split(/\r\n|\n|\r/u).flatMap((line, lineIndex) => (
-    [...line.matchAll(/[^。！？；]+[。！？；]*/gu)].flatMap((match) => {
+  const lines = source === 'rule'
+    ? indexRuleLines(value).filter(({ isHeading }) => !isHeading)
+    : value.split(/\r\n|\n|\r/u).map((text, lineIndex) => ({ text, line: lineIndex + 1, column: 1 }));
+  return lines.flatMap((row) => (
+    [...row.text.matchAll(/[^。！？；]+[。！？；]*/gu)].flatMap((match) => {
       const text = match[0].trim();
       if (!text) return [];
       const offset = match.index + match[0].indexOf(text);
+      const context = source === 'rule' ? clauseScope(row, text) : {};
       const windows = [];
       for (let start = 0; start < text.length; start += segmentLength - segmentOverlap) {
         const fragment = text.slice(start, start + segmentLength);
-        const number = lineIndex + 1;
-        const column = offset + start + 1;
+        const number = row.line;
+        const column = row.column + offset + start;
         windows.push({
           id: `${source}-${number}-${column}`,
           source,
           line: number,
           column,
           text: fragment,
+          ...context,
           normalized: normalize(fragment),
         });
         if (start + segmentLength >= text.length) break;
@@ -205,11 +215,13 @@ function directExcerpt({ normalized: _, ...excerpt }) {
   return { ...excerpt, score: 1 };
 }
 
-function collect({ preset, query, ruleExcerpts, projectExcerpts, missing, suggestions }) {
+function collect({ preset, query, scope, resolvedScopes, ruleExcerpts, projectExcerpts, missing, suggestions }) {
   const unique = (entries) => [...new Map(entries.map((entry) => [entry.id, entry])).values()];
   return {
     preset,
     query,
+    scope,
+    resolvedScopes,
     ruleExcerpts: unique(ruleExcerpts),
     projectExcerpts: unique(projectExcerpts),
     missing,
@@ -219,7 +231,9 @@ function collect({ preset, query, ruleExcerpts, projectExcerpts, missing, sugges
 
 function reviewTopics(result, rules, project) {
   for (const topic of topics[result.preset]) {
-    const ruleMatches = rules.filter(({ text }) => topic.rule.test(text));
+    const ruleMatches = rules.filter(({ text, stage }) => topic.rule.test(text)
+      && (topic.id !== 'deadline' || !result.resolvedScopes.length
+        || (dateEvidence.test(text) && (result.resolvedScopes.includes(stage) || mentionedStages(text).length === 2))));
     const projectMatches = project.filter(({ text }) => topic.project.test(text));
     const ruleRefs = rank(ruleMatches, topic.keywords, 2);
     const projectRefs = rank(projectMatches, topic.keywords, 2);
@@ -244,7 +258,7 @@ function reviewTopics(result, rules, project) {
 }
 
 function reviewDeliverables(result, ruleText, rules, project) {
-  const { materials } = analyzeRules(ruleText);
+  const { materials } = analyzeRules(ruleText, '', { scope: result.scope });
   if (!materials.length) {
     result.missing.push('赛规中未定位到明确的交付物条款。可改用自定义问题查找原文。');
     return;
@@ -258,28 +272,44 @@ function reviewDeliverables(result, ruleText, rules, project) {
   }, new Map());
 
   for (const material of materials) {
-    const candidates = byLine.get(material.line) ?? [];
-    const source = candidates.find(({ text }) => text.includes(material.quote))
-      ?? candidates.find(({ text }) => material.quote.includes(text));
-    if (!source) continue;
-    const labels = materialKeywords[material.id] ?? material.title;
+    const sources = material.references.flatMap((reference) => {
+      const candidates = byLine.get(reference.line) ?? [];
+      const closest = candidates.find(({ text, column }) => column <= reference.column
+        && reference.column < column + text.length && text.includes(reference.text))
+        ?? candidates.find(({ text, column }) => reference.column <= column
+          && column < reference.column + reference.text.length && reference.text.includes(text));
+      return closest ? [directExcerpt(closest)] : [];
+    });
+    if (!sources.length) continue;
+    const labels = materialKeywords[material.typeId] ?? material.title;
     const matchesMaterial = labels.split(' ').map((label) => termMatcher(normalize(label)));
     const relevant = project.filter(({ normalized }) => matchesMaterial.some((match) => match(normalized)));
     const projectRefs = rank(relevant, labels, 1);
-    const description = materialActions[material.id] ?? '对照赛规核实准备情况，记录交付链接或文件。';
+    const description = materialActions[material.typeId] ?? '对照赛规核实准备情况，记录交付链接或文件。';
 
     if (!projectRefs.length) missingTitles.push(material.title);
-    result.ruleExcerpts.push(directExcerpt(source));
+    result.ruleExcerpts.push(...sources);
     result.projectExcerpts.push(...projectRefs);
     result.suggestions.push({
       id: material.id,
       title: `核对${material.title}`,
       description,
-      ruleRefs: [source.id],
+      ruleRefs: [...new Set(sources.map(({ id }) => id))],
       projectRefs: projectRefs.map(({ id }) => id),
     });
   }
   if (missingTitles.length) result.missing.push(`项目摘要暂无明确线索：${missingTitles.join('、')}。`);
+}
+
+function scopedCustomRules(rules, stage, query) {
+  const matching = rules.filter((entry) => allowsStage(entry.stage, stage));
+  if (!deadlineQuery.test(query)) return matching;
+  const needsSubmission = submissionTiming.test(query);
+  const needsRegistration = registrationTiming.test(query);
+  return matching.filter(({ stage: entryStage, text }) => dateEvidence.test(text)
+    && (entryStage === stage || mentionedStages(text).length === 2)
+    && (!needsSubmission || needsRegistration || submissionTiming.test(text))
+    && (!needsRegistration || needsSubmission || registrationTiming.test(text)));
 }
 
 function reviewCustom(result, rules, project) {
@@ -287,33 +317,63 @@ function reviewCustom(result, rules, project) {
     result.missing.push('输入问题后，可在赛规和项目摘要中检索相关原文。');
     return;
   }
-  const ruleRefs = rank(rules, result.query, 5);
   const projectRefs = rank(project, result.query, 3);
-  result.ruleExcerpts.push(...ruleRefs);
   result.projectExcerpts.push(...projectRefs);
-  if (!ruleRefs.length) result.missing.push('赛规中未找到与该问题匹配的条款，建议换用赛规里的关键词。');
+  for (const scope of result.resolvedScopes.length ? result.resolvedScopes : ['all']) {
+    const candidates = scope === 'all' ? rules : scopedCustomRules(rules, scope, result.query);
+    const ruleRefs = rank(candidates, result.query, result.resolvedScopes.length > 1 ? 3 : 5);
+    const label = RULE_SCOPE_LABELS[scope];
+    if (!ruleRefs.length) {
+      result.missing.push(label
+        ? `赛规中未定位到明确适用于${label}的条款。请核对该阶段的官方通知。`
+        : '赛规中未找到与该问题匹配的条款，建议换用赛规里的关键词。');
+      continue;
+    }
+    result.ruleExcerpts.push(...ruleRefs);
+    result.suggestions.push({
+      id: scope === 'all' ? 'custom-review' : `custom-review@${scope}`,
+      title: `核对${label ?? ''}：${result.query.slice(0, 42)}`,
+      description: '对照命中条款和摘要片段，写下待确认事项及需要补充的材料。',
+      ruleRefs: ruleRefs.slice(0, 3).map(({ id }) => id),
+      projectRefs: projectRefs.slice(0, 2).map(({ id }) => id),
+    });
+  }
+  if (result.resolvedScopes.length > 1) {
+    const mixed = rank(rules.filter(({ stage }) => stage === 'mixed'), result.query, 2);
+    result.ruleExcerpts.push(...mixed);
+    if (mixed.length) {
+      result.suggestions.push({
+        id: 'custom-review@mixed',
+        title: '对照同条原文中的两个阶段',
+        description: '按原文逐项对应省赛和国赛的条件，记录各自适用范围。',
+        ruleRefs: mixed.map(({ id }) => id),
+        projectRefs: [],
+      });
+    }
+  }
   if (!projectRefs.length) result.missing.push('项目摘要中暂无与该问题匹配的明确线索。');
-  if (!ruleRefs.length) return;
-  result.suggestions.push({
-    id: 'custom-review',
-    title: `核对：${result.query.slice(0, 42)}`,
-    description: '对照命中条款和摘要片段，写下待确认事项及需要补充的材料。',
-    ruleRefs: ruleRefs.slice(0, 3).map(({ id }) => id),
-    projectRefs: projectRefs.slice(0, 2).map(({ id }) => id),
-  });
 }
 
-export function runLocalReview({ ruleText = '', projectSummary = '', preset = 'custom', query = '' } = {}) {
+export function runLocalReview({ ruleText = '', projectSummary = '', preset = 'custom', query = '', scope = 'all' } = {}) {
   const selection = REVIEW_PRESETS.find(({ id }) => id === preset) ?? REVIEW_PRESETS.at(-1);
+  const requestedScope = validRuleScope(scope) ? scope : 'all';
+  const question = selection.id === 'custom' ? query.trim() : selection.query;
+  const stagesInQuestion = selection.id === 'custom' ? mentionedStages(question) : [];
   const result = {
     preset: selection.id,
-    query: selection.id === 'custom' ? query.trim() : selection.query,
+    query: question,
+    scope: requestedScope,
+    resolvedScopes: requestedScope === 'all' ? stagesInQuestion : [requestedScope],
     ruleExcerpts: [],
     projectExcerpts: [],
     missing: [],
     suggestions: [],
   };
-  const rules = indexSource('rule', ruleText);
+  if (requestedScope !== 'all' && stagesInQuestion.some((stage) => stage !== requestedScope)) {
+    result.missing.push('所选阶段与问题中提到的阶段不一致。请调整所选阶段或问题内容。');
+    return collect(result);
+  }
+  const rules = indexSource('rule', ruleText).filter(({ stage }) => allowsStage(stage, requestedScope));
   const project = indexSource('project', projectSummary);
 
   if (topics[result.preset]) reviewTopics(result, rules, project);

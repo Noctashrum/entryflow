@@ -148,3 +148,49 @@ test('structured review reuses local evidence, withholds unrelated source text a
   assert.equal((await post(origin, { ...inputs, ruleText: '必须具有正式学籍。' })).status, 422);
   assert.equal(captured.length, 4);
 });
+
+test('both model protocols constrain explicitly scoped deadlines before validating citations', async (context) => {
+  const captured = [];
+  let replyCode = 'actual';
+  const upstream = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const { messages } = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const input = JSON.parse(messages[1].content);
+    captured.push(input);
+    const actual = input.evidence?.find(({ source }) => source === 'rule')?.id ?? input.excerpts[0].line;
+    const wrong = input.evidence ? 'rule-3-1' : 3;
+    const content = JSON.stringify({ answer: '核对该阶段公告的交件日期。', citations: [replyCode === 'actual' ? actual : wrong] });
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ choices: [{ message: { content } }] }));
+  });
+  const upstreamOrigin = await start(upstream, context);
+  const origin = await start(createEntryFlowServer({ env: {
+    ENTRYFLOW_AI_BASE_URL: `${upstreamOrigin}/v1`,
+    ENTRYFLOW_AI_API_KEY: 'mock-test-key',
+    ENTRYFLOW_AI_MODEL: 'mock-model',
+  } }), context);
+  const source = {
+    ruleText: '省赛安排\n1.时间安排：\n作品提交截止时间：2026年11月18日\n国赛安排\n1.时间安排：\n作品提交截止时间：2026年12月27日',
+    query: '国赛作品提交截止是哪天？',
+  };
+  const explicit = await post(origin, { ...source, preset: 'custom', scope: 'national' });
+  assert.equal(explicit.status, 200);
+  const [{ stage, stageHeading, line, text }] = (await explicit.json()).citations;
+  assert.deepEqual({ stage, line, text }, { stage: 'national', line: 6, text: '作品提交截止时间：2026年12月27日' });
+  assert.equal(stageHeading.line, 4);
+  assert.equal(captured[0].evidence.length, 1);
+  assert.match(captured[0].evidence[0].text, /12月27日/u);
+  assert.ok(!JSON.stringify(captured[0]).includes('11月18日'));
+
+  const legacy = await post(origin, source);
+  assert.equal(legacy.status, 200);
+  assert.deepEqual((await legacy.json()).citations, [{ line: 6, text: '作品提交截止时间：2026年12月27日' }]);
+  assert.ok(!JSON.stringify(captured[1]).includes('11月18日'));
+  replyCode = 'wrong';
+  assert.equal((await post(origin, { ...source, preset: 'custom' })).status, 502);
+  assert.equal((await post(origin, source)).status, 502);
+  assert.equal((await post(origin, { ...source, preset: 'custom', scope: 'provincial' })).status, 422);
+  assert.equal((await post(origin, { ...source, preset: 'custom', scope: 'bogus' })).status, 400);
+  assert.equal(captured.length, 4);
+});
