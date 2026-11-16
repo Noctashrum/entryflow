@@ -1,16 +1,19 @@
 import './styles.css';
 import { icon, keepFocusedControlInView, renderShell } from './layout.js';
-import { analyzeRules, readRuleFile, retrieveEvidence } from './evidence.js';
+import { analyzeRules, readRuleFile } from './evidence.js';
 import { REVIEW_PRESETS, runLocalReview } from './retrieval.js';
-import { demoDraft } from './demo.js';
+import { demoDraft, stageDemoDraft } from './demo.js';
 import {
   DRAFT_FIELDS,
   GATE_STATUS,
+  RULE_STAGE_LABELS,
+  SCOPE_LABELS,
   TASK_STATUS,
   addGate,
   addSubmissionReviewTasks,
   addTask,
   applyAnalysis,
+  currentScope,
   currentSubmissionReview,
   exportChecklist,
   generateChecklist,
@@ -23,6 +26,7 @@ import {
   submissionReviewOptions,
   submissionReviewStatus,
   summarize,
+  switchScope,
 } from './workflow.js';
 
 const storageKey = 'entryflow-workspace-v1';
@@ -200,7 +204,8 @@ function openStage(stage, { focus = true } = {}) {
 
 function sampleTag() {
   if (!state.sample) return '';
-  const originalSample = DRAFT_FIELDS.every(field => state.draft[field] === demoDraft[field]);
+  const original = state.sampleKind === 'stages' ? stageDemoDraft : demoDraft;
+  const originalSample = DRAFT_FIELDS.every(field => state.draft[field] === original[field]);
   return badge(originalSample ? '官方赛规摘编 · 虚构项目' : '示例资料已修改');
 }
 
@@ -277,19 +282,23 @@ function updateIntakeAside() {
   `) + panel('提取方式', '', `
     <p class="field-hint">系统按录入文本提取候选门槛与材料，并保留出处供你核对。</p>
     <p class="field-hint">将资格、提交要求和截止日期分行录入，更容易定位引用。</p>
-  `);
+  `) + panel('赛段示例', '', `
+    <p class="field-hint">同一份赛规摘编包含省赛、国赛和通用条款，便于对比各赛段的截止与投递要求。</p>
+  `, button('载入赛段示例', 'load-stage-sample', { symbol: 'sample' }));
 }
 
 function sourceLine(item) {
+  const stage = item.source === 'project' || !item.stage ? '' : RULE_STAGE_LABELS[item.stage];
+  const tag = stage ? badge(stage, item.stage === 'general' ? 'neutral' : 'success') : '';
   if (!item.line) {
     const label = item.manual || item.kind === 'manual' || item.kind === 'gate' ? '手动补录' : '赛规摘录';
-    return `<span class="muted">${label}</span>`;
+    return `<span class="citation-location"><span class="muted">${label}</span>${tag}</span>`;
   }
-  return `<button type="button" class="inline-link" data-action="show-line" data-line="${Number(item.line)}"
+  return `<span class="citation-location"><button type="button" class="inline-link" data-action="show-line" data-line="${Number(item.line)}"
     data-document="${item.source === 'project' ? 'project' : 'rule'}"
-    data-column="${Number(item.column) || 1}" data-excerpt-length="${item.text?.length || 0}">
+    data-column="${Number(item.column) || 1}" data-excerpt-length="${(item.text ?? item.quote)?.length || 0}">
     ${icon('link', 14)} ${escapeHtml(reviewCitationLabel(item))}
-  </button>`;
+  </button>${tag}${item.section ? `<span class="citation-section">${escapeHtml(item.section)}</span>` : ''}</span>`;
 }
 
 function gateTone(status) {
@@ -335,6 +344,13 @@ function renderReview() {
 
   const gates = state.analysis.gates;
   return `<div class="panel-stack">
+    ${panel('核验赛段', '', `<div class="scope-control">
+      <div class="field">
+        <label for="competition-scope">当前赛规范围</label>
+        <select id="competition-scope" aria-describedby="competition-scope-hint">${options(SCOPE_LABELS, currentScope(state))}</select>
+      </div>
+      <p id="competition-scope-hint" class="field-hint">所选范围用于门槛、复核和清单，各赛段分别保存。明确通用的条款适用于所有范围。</p>
+    </div>`)}
     ${renderSubmissionReview()}
     ${panel('候选门槛', '引用来自当前录入文本。请按实际凭据确认核验结果。',
       gates.length
@@ -390,7 +406,8 @@ function updateEvidenceResults() {
   const region = aside.querySelector('#evidence-results');
   if (!region || !hasCurrentAnalysis(state)) return;
   const results = evidenceQuery
-    ? retrieveEvidence(state.draft.rule, evidenceQuery, 5)
+    ? runLocalReview({ ruleText: state.draft.rule, projectSummary: '', preset: 'custom',
+      query: evidenceQuery, scope: currentScope(state) }).ruleExcerpts.slice(0, 5)
     : state.analysis.excerpts.slice(0, 3);
   region.innerHTML = results.length
     ? `<ol class="evidence-results">
@@ -467,6 +484,10 @@ function renderSubmissionReviewResult(selected = new Set(), question) {
 
   const review = currentSubmissionReview(state);
   const { result } = review;
+  const resolvedScopes = result.resolvedScopes ?? [];
+  const scopeLabel = resolvedScopes.length
+    ? resolvedScopes.map(scope => SCOPE_LABELS[scope]).join('、')
+    : SCOPE_LABELS[currentScope(state)];
   const tasks = reviewSourcesMatch(state, state.checklist) ? state.checklist.items : [];
   const existing = new Set(tasks.map(task => task.key));
   const suggestions = submissionReviewOptions(state);
@@ -479,7 +500,7 @@ function renderSubmissionReviewResult(selected = new Set(), question) {
         <h3 id="submission-result-title" tabindex="-1">复核结果</h3>
         <p>${escapeHtml(result.query)}</p>
       </div>
-      ${badge('本地证据', 'success')}
+      <div class="review-result-tags">${badge(scopeLabel)}${badge('本地证据', 'success')}</div>
     </header>
     <div class="review-source-grid">
       <section>
@@ -573,6 +594,7 @@ async function requestAiReview() {
       body: JSON.stringify({
         ruleText: state.draft.rule,
         projectSummary: state.draft.summary,
+        scope: currentScope(state),
         preset,
         query,
       }),
@@ -611,6 +633,11 @@ function renderTask(task, index) {
       </div>
     </div>
     ${task.quote ? `<div class="evidence-quote">${sourceLine(task)}<blockquote>${escapeHtml(task.quote)}</blockquote></div>` : ''}
+    ${task.references?.some(reference => reference.line !== task.line || reference.text !== task.quote) ?
+      `<details class="review-task-evidence">
+        <summary>其他赛规出处</summary>
+        ${citationList(task.references.filter(reference => reference.line !== task.line || reference.text !== task.quote))}
+      </details>` : ''}
     ${task.kind === 'review' ? `<details class="review-task-evidence">
       <summary>复核问题及引用（${task.citations.length}）</summary>
       <p><strong>${escapeHtml(task.question)}</strong> · ${task.reviewMode === 'model' ? '模型复核' : '本地证据复核'}</p>
@@ -649,7 +676,7 @@ function renderChecklist() {
 
   const tasks = state.checklist.items;
   return `<div class="panel-stack">
-    ${panel('投递任务', '对照赛规出处维护负责人和准备进度。',
+    ${panel('投递任务', `当前核验赛段为${SCOPE_LABELS[currentScope(state)]}。对照赛规出处维护负责人和准备进度。`,
       tasks.length
         ? `<div class="task-list">${tasks.map(renderTask).join('')}</div>`
         : emptyState('暂无投递任务', '当前材料提取为空，可按规则补充任务。'))}
@@ -703,9 +730,9 @@ function focusDocumentLine(line, documentKind, column, excerptLength) {
   field.scrollTop = Math.max(0, (line - 2) * (parseFloat(getComputedStyle(field).lineHeight) || 20));
 }
 
-function resetWorkspace(sample) {
+function resetWorkspace(sampleKind) {
   if (DRAFT_FIELDS.some(field => state.draft[field].trim()) &&
-      !window.confirm(sample ? '载入演示将替换当前工作台资料。继续吗？' : '清空当前资料、核验和投递清单？')) {
+      !window.confirm(sampleKind ? '载入演示将替换当前工作台资料。继续吗？' : '清空当前资料、核验和投递清单？')) {
     return;
   }
   ++importToken;
@@ -714,12 +741,13 @@ function resetWorkspace(sample) {
   evidenceQuery = '';
   aiRequest = null;
   state = initialState();
-  if (sample) {
-    state.draft = { ...demoDraft };
+  if (sampleKind) {
+    state.draft = { ...(sampleKind === 'stages' ? stageDemoDraft : demoDraft) };
     state.sample = true;
+    state.sampleKind = sampleKind;
   }
   openStage('intake');
-  notice(sample ? '演示资料已载入' : '工作台资料已清空');
+  notice(sampleKind ? '演示资料已载入' : '工作台资料已清空');
 }
 
 async function readImportedFile(file) {
@@ -778,8 +806,9 @@ app.addEventListener('click', event => {
   }
 
   switch (control.dataset.action) {
-    case 'load-sample': resetWorkspace(true); break;
-    case 'clear-workspace': resetWorkspace(false); break;
+    case 'load-sample': resetWorkspace('standard'); break;
+    case 'load-stage-sample': resetWorkspace('stages'); break;
+    case 'clear-workspace': resetWorkspace(); break;
     case 'open-intake': openStage('intake'); break;
     case 'open-review': openStage('review'); break;
     case 'open-checklist': openStage('checklist'); break;
@@ -835,6 +864,14 @@ app.addEventListener('change', event => {
   if (field.id === 'rule-file') {
     void readImportedFile(field.files[0]);
     field.value = '';
+  } else if (field.id === 'competition-scope') {
+    if (!switchScope(state, field.value)) return;
+    if (!hasCurrentAnalysis(state)) extractCurrentScope();
+    evidenceQuery = '';
+    save();
+    renderStage();
+    content.querySelector('#competition-scope')?.focus();
+    notice(`已切换至${SCOPE_LABELS[currentScope(state)]}核验`);
   } else if (field.name === 'preset' && field.form?.id === 'submission-review-form') {
     const custom = field.value === 'custom';
     const question = content.querySelector('#submission-question');
@@ -879,10 +916,14 @@ function handleIntake(form, values) {
   }
 
   state.draft = Object.fromEntries(DRAFT_FIELDS.map(field => [field, String(values.get(field) ?? '')]));
-  applyAnalysis(state, analyzeRules(state.draft.rule, state.draft.summary));
+  extractCurrentScope();
   evidenceQuery = '';
   openStage('review');
   notice('门槛与材料已提取');
+}
+
+function extractCurrentScope() {
+  applyAnalysis(state, analyzeRules(state.draft.rule, state.draft.summary, { scope: currentScope(state) }));
 }
 
 app.addEventListener('submit', event => {
@@ -910,6 +951,7 @@ app.addEventListener('submit', event => {
       saveSubmissionReview(state, runLocalReview({
         ruleText: state.draft.rule,
         projectSummary: state.draft.summary,
+        scope: currentScope(state),
         preset,
         query,
       }));

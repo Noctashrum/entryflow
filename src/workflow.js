@@ -12,10 +12,24 @@ export const TASK_STATUS = {
   done: '已完成',
 };
 
+export const SCOPE_LABELS = {
+  all: '全部阶段',
+  provincial: '省赛',
+  national: '国赛',
+};
+
+export const RULE_STAGE_LABELS = {
+  provincial: '省赛',
+  national: '国赛',
+  general: '通用',
+  mixed: '跨赛段',
+};
+
 export function initialState() {
   return {
     version: 1,
     stage: 'intake',
+    scope: 'all',
     draft: Object.fromEntries(DRAFT_FIELDS.map(field => [field, ''])),
     fileName: '',
     sample: false,
@@ -25,16 +39,45 @@ export function initialState() {
   };
 }
 
-function draftFingerprint(draft) {
-  return JSON.stringify(DRAFT_FIELDS.map(field => field === 'rule' ? draft[field] : draft[field].trim()));
+export function currentScope(state) {
+  return Object.hasOwn(SCOPE_LABELS, state.scope) ? state.scope : 'all';
 }
 
-function workspaceKey(draft) {
-  return JSON.stringify([draft.competition.trim(), draft.source.trim(), draft.project.trim()]);
+export function switchScope(state, target) {
+  const current = currentScope(state);
+  if (current === target || !Object.hasOwn(SCOPE_LABELS, target)) return false;
+  const saved = state.scopeWorkspaces ??= {};
+  saved[current] = {
+    analysis: state.analysis,
+    checklist: state.checklist,
+    submissionReview: state.submissionReview,
+  };
+  const next = saved[target];
+  state.scope = target;
+  state.analysis = next?.analysis ?? null;
+  state.checklist = next?.checklist ?? null;
+  state.submissionReview = next?.submissionReview ?? null;
+  delete saved[target];
+  return true;
+}
+
+function scopeKey(values, state) {
+  const scope = currentScope(state);
+  if (scope !== 'all') values.push(scope);
+  return JSON.stringify(values);
+}
+
+function draftFingerprint(state) {
+  return scopeKey(DRAFT_FIELDS.map(field => field === 'rule' ? state.draft[field] : state.draft[field].trim()), state);
+}
+
+function workspaceKey(state) {
+  const { competition, source, project } = state.draft;
+  return scopeKey([competition.trim(), source.trim(), project.trim()], state);
 }
 
 export function hasCurrentAnalysis(state) {
-  return state.analysis?.fingerprint === draftFingerprint(state.draft);
+  return state.analysis?.fingerprint === draftFingerprint(state);
 }
 
 function reviewSignature(state) {
@@ -146,13 +189,15 @@ export function addSubmissionReviewTasks(state, selectedKeys) {
 }
 
 function requirementKey(item) {
-  return JSON.stringify([item.title, item.quote]);
+  return JSON.stringify(item.stage && item.stage !== 'general'
+    ? [item.title, item.quote, item.stage]
+    : [item.title, item.quote]);
 }
 
 export function applyAnalysis(state, result) {
   const previous = state.analysis;
-  const fingerprint = draftFingerprint(state.draft);
-  const workspace = workspaceKey(state.draft);
+  const fingerprint = draftFingerprint(state);
+  const workspace = workspaceKey(state);
   const sameWorkspace = previous?.workspace === workspace;
   const sameInputs = previous?.fingerprint === fingerprint;
   const earlier = new Map(sameInputs ? previous.gates.map(gate => [gate.key, gate]) : []);
@@ -196,25 +241,31 @@ export function addGate(state, title, quote) {
     status: 'pending',
     note: '',
     manual: true,
+    stage: currentScope(state) === 'all' ? 'general' : currentScope(state),
   });
 }
 
 export function generateChecklist(state) {
   if (!hasCurrentAnalysis(state)) return;
   const previous = state.checklist;
-  const workspace = workspaceKey(state.draft);
+  const workspace = workspaceKey(state);
   const sameWorkspace = previous?.workspace === workspace;
   const earlier = new Map(sameWorkspace ? previous.items.map(item => [item.key, item]) : []);
   const items = new Map();
 
-  const insert = (key, title, kind, quote, line) => {
+  const insert = (key, title, kind, requirement) => {
     const existing = earlier.get(key);
+    const { quote, line, column, stage, section, references } = requirement;
     items.set(key, {
       key,
       title,
       kind,
       quote,
       line,
+      column,
+      stage,
+      section,
+      references,
       owner: existing?.owner ?? '',
       note: existing?.note ?? '',
       status: existing?.status ?? 'pending',
@@ -222,7 +273,7 @@ export function generateChecklist(state) {
   };
 
   for (const material of state.analysis.materials) {
-    insert(`material:${requirementKey(material)}`, material.title, 'material', material.quote, material.line);
+    insert(`material:${requirementKey(material)}`, material.title, 'material', material);
   }
 
   for (const gate of state.analysis.gates) {
@@ -230,7 +281,7 @@ export function generateChecklist(state) {
     const instruction = gate.status === 'fail' ? '处理阻塞' : '确认门槛';
     const key = `gate:${gate.status}:${gate.key}`;
     if (previous?.fingerprint !== state.analysis.fingerprint) earlier.delete(key);
-    insert(key, `${instruction} · ${gate.title}`, 'gate', gate.quote, gate.line);
+    insert(key, `${instruction} · ${gate.title}`, 'gate', gate);
   }
 
   const manual = sameWorkspace ? previous.items.filter(item => item.kind === 'manual') : [];
@@ -280,13 +331,18 @@ function markdown(value) {
 }
 
 function sourceReference(item) {
-  if (item.line) return `赛规第 ${item.line} 行`;
+  if (item.line) return reviewCitationLabel(item);
   return item.manual || item.kind === 'gate' || item.kind === 'manual' ? '手动补录' : '赛规摘录';
 }
 
 export function reviewCitationLabel(item) {
   const document = item.source === 'project' ? '项目摘要' : '赛规';
   return `${document}第 ${item.line} 行`;
+}
+
+function stageReference(item) {
+  const stage = RULE_STAGE_LABELS[item.stage];
+  return stage ? `（${stage}${item.section ? ` · ${markdown(item.section)}` : ''}）` : '';
 }
 
 export function exportChecklist(state) {
@@ -296,6 +352,7 @@ export function exportChecklist(state) {
     `# ${markdown(draft.competition)} 投递清单`,
     '',
     `- 项目：${markdown(draft.project)}`,
+    `- 核验赛段：${SCOPE_LABELS[currentScope(state)]}`,
   ];
   if (draft.source) lines.push(`- 赛规来源：${markdown(draft.source)}`);
   if (state.sample) lines.push('- 工作台曾载入演示样例，请按当前资料核对内容。');
@@ -303,7 +360,7 @@ export function exportChecklist(state) {
   if (!analysis.gates.length) lines.push('暂无可辨识或手动录入的门槛。');
   for (const gate of analysis.gates) {
     lines.push(`- **${markdown(gate.title)}** · ${GATE_STATUS[gate.status]}`);
-    if (gate.quote) lines.push(`  - ${sourceReference(gate)}：${markdown(gate.quote)}`);
+    if (gate.quote) lines.push(`  - ${sourceReference(gate)}${stageReference(gate)}：${markdown(gate.quote)}`);
     if (gate.note) lines.push(`  - 核验备注：${markdown(gate.note)}`);
   }
   lines.push('', '## 投递任务', '');
@@ -313,13 +370,17 @@ export function exportChecklist(state) {
     lines.push(`- [${mark}] ${markdown(item.title)} · ${TASK_STATUS[item.status]}`);
     if (item.owner) lines.push(`  - 负责人：${markdown(item.owner)}`);
     if (item.note) lines.push(`  - 备注：${markdown(item.note)}`);
-    if (item.quote) lines.push(`  - ${sourceReference(item)}：${markdown(item.quote)}`);
+    if (item.quote) lines.push(`  - ${sourceReference(item)}${stageReference(item)}：${markdown(item.quote)}`);
+    for (const reference of item.references ?? []) {
+      if (reference.line === item.line && reference.text === item.quote) continue;
+      lines.push(`  - ${sourceReference(reference)}${stageReference(reference)}：${markdown(reference.text)}`);
+    }
     if (item.kind === 'review') {
       lines.push(`  - 复核来源：${item.reviewMode === 'model' ? '模型复核' : '本地证据复核'}`);
       lines.push(`  - 复核问题：${markdown(item.question)}`);
       if (item.description) lines.push(`  - 复核建议：${markdown(item.description)}`);
       for (const citation of item.citations) {
-        lines.push(`  - ${reviewCitationLabel(citation)}：${markdown(citation.text)}`);
+        lines.push(`  - ${reviewCitationLabel(citation)}${stageReference(citation)}：${markdown(citation.text)}`);
       }
     }
   }

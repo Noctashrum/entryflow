@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { demoDraft } from '../src/demo.js';
+import { demoDraft, stageDemoDraft } from '../src/demo.js';
 import { analyzeRules } from '../src/evidence.js';
 import { runLocalReview } from '../src/retrieval.js';
 import {
-  addGate, addSubmissionReviewTasks, addTask, applyAnalysis, currentSubmissionReview, exportChecklist,
+  addGate, addSubmissionReviewTasks, addTask, applyAnalysis, currentScope, currentSubmissionReview, exportChecklist,
   generateChecklist, hasCurrentAnalysis, hasCurrentChecklist, initialState, saveSubmissionReview,
-  submissionReviewOptions, submissionReviewStatus, summarize,
+  submissionReviewOptions, submissionReviewStatus, summarize, switchScope,
 } from '../src/workflow.js';
 
 function demoWorkspace() {
@@ -18,7 +18,7 @@ function demoWorkspace() {
 }
 
 function reanalyze(state) {
-  applyAnalysis(state, analyzeRules(state.draft.rule, state.draft.summary));
+  applyAnalysis(state, analyzeRules(state.draft.rule, state.draft.summary, { scope: currentScope(state) }));
 }
 
 test('official excerpts yield inspectable, unconfirmed gates and material tasks', () => {
@@ -208,4 +208,105 @@ test('changing the selected question is distinct from changing source materials'
   assert.equal(submissionReviewStatus(state, { preset: 'custom', query: '视频时长？' }), 'stale');
   delete state.submissionReview.sourceSummary;
   assert.equal(submissionReviewStatus(state, { preset: 'custom', query: '视频时长？' }), 'empty');
+});
+
+test('legacy workspaces remain all-stage and their progress survives switching and reload', () => {
+  const legacy = demoWorkspace();
+  delete legacy.scope;
+  generateChecklist(legacy);
+  legacy.checklist.items[0].status = 'done';
+  const state = JSON.parse(JSON.stringify(legacy));
+
+  assert.equal(currentScope(state), 'all');
+  assert.equal(hasCurrentChecklist(state), true);
+  assert.equal(switchScope(state, '__proto__'), false);
+  assert.equal(switchScope(state, 'provincial'), true);
+  assert.equal(hasCurrentAnalysis(state), false);
+  reanalyze(state);
+  generateChecklist(state);
+  assert.equal(summarize(state).completed, 0);
+  assert.equal(switchScope(state, 'all'), true);
+  assert.equal(hasCurrentChecklist(state), true);
+  assert.equal(summarize(state).completed, 1);
+});
+
+function stagedWorkspace() {
+  const state = initialState();
+  state.draft = { ...stageDemoDraft };
+  reanalyze(state);
+  return state;
+}
+
+function runScopedReview(state, preset, query) {
+  return saveSubmissionReview(state, runLocalReview({
+    ruleText: state.draft.rule,
+    projectSummary: state.draft.summary,
+    preset,
+    query,
+    scope: currentScope(state),
+  }));
+}
+
+test('a stage change uses its own gates, source materials and saved checklist', () => {
+  const state = stagedWorkspace();
+  assert.equal(state.analysis.materials.length, 12);
+
+  switchScope(state, 'provincial');
+  reanalyze(state);
+  const provincialDeadline = state.analysis.gates.find(gate => gate.quote.includes('2026-11-18'));
+  provincialDeadline.status = 'pass';
+  generateChecklist(state);
+  state.checklist.items.find(item => item.kind === 'material').status = 'done';
+  assert.equal(state.analysis.materials.length, 6);
+  assert.ok(state.analysis.materials.every(material => material.stage === 'provincial'));
+
+  switchScope(state, 'national');
+  reanalyze(state);
+  assert.ok(state.analysis.gates.every(gate => gate.status === 'pending'));
+  assert.ok(state.analysis.gates.some(gate => gate.quote.includes('2026-12-27')));
+  assert.ok(state.analysis.gates.every(gate => gate.stage !== 'provincial'));
+  assert.ok(state.analysis.materials.every(material => material.stage === 'national'));
+  generateChecklist(state);
+  assert.equal(summarize(state).completed, 0);
+  assert.equal(state.checklist.items.filter(item => item.kind === 'material').length, 6);
+  const markdown = exportChecklist(state);
+  assert.match(markdown, /核验赛段：国赛/);
+  assert.match(markdown, /（国赛 · 作品提交要求）/);
+  assert.doesNotMatch(markdown, /11\\?-18|获奖|优秀奖|过程可复现性占/);
+
+  const restored = JSON.parse(JSON.stringify(state));
+  assert.equal(currentScope(restored), 'national');
+  assert.equal(hasCurrentChecklist(restored), true);
+  assert.equal(switchScope(restored, 'provincial'), true);
+  assert.equal(hasCurrentChecklist(restored), true);
+  assert.equal(summarize(restored).completed, 1);
+  assert.equal(restored.analysis.gates.find(gate => gate.key === provincialDeadline.key).status, 'pass');
+});
+
+test('stage-specific review citations survive adoption but stale source material cannot be adopted', () => {
+  const state = stagedWorkspace();
+  const result = runScopedReview(state, 'custom', '国赛作品提交什么时候截止？').result;
+  assert.deepEqual(result.resolvedScopes, ['national']);
+  assert.ok(result.ruleExcerpts.length > 0);
+  const citation = result.ruleExcerpts[0];
+  assert.equal(citation.stage, 'national');
+  assert.ok(state.draft.rule.split('\n')[citation.line - 1].includes(citation.text));
+  const option = submissionReviewOptions(state)[0];
+  assert.equal(addSubmissionReviewTasks(state, [option.key]), 1);
+  assert.match(exportChecklist(state), /国赛作品提交截止 2026\\-12\\-27/);
+
+  switchScope(state, 'provincial');
+  reanalyze(state);
+  const mismatch = runScopedReview(state, 'custom', '国赛作品提交什么时候截止？').result;
+  assert.deepEqual(mismatch.ruleExcerpts, []);
+  assert.deepEqual(submissionReviewOptions(state), []);
+
+  state.draft.rule += '\n补充核验提示。';
+  switchScope(state, 'all');
+  assert.equal(hasCurrentAnalysis(state), false);
+  assert.equal(currentSubmissionReview(state), null);
+  assert.equal(addSubmissionReviewTasks(state, [option.key]), 0);
+  reanalyze(state);
+  generateChecklist(state);
+  assert.ok(!state.checklist.items.some(item => item.kind === 'review'));
 });
