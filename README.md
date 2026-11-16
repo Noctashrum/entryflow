@@ -88,3 +88,5 @@ node --env-file=.env server/index.js
 
 [投递复核工作流迭代](docs/dev/agent-rag-workflow.md)
  · [跨赛段核验工作流迭代](docs/dev/agent-scope-workflow.md)
+
+[评审复现索引与三条 Prompt 迭代链](docs/dev/reviewer-guide.md)
